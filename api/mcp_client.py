@@ -203,11 +203,43 @@ class MCPClient:
                                     if hasattr(response, 'candidates') and response.candidates:
                                         for candidate in response.candidates:
                                             if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                                                print("huha",candidate.content.parts)
                                                 for part in candidate.content.parts:
+                                                    # Handle text response
                                                     if hasattr(part, 'text') and part.text:
                                                         self.add_message("assistant", part.text)
                                                         return part.text
+                                                    # Handle function call
+                                                    elif hasattr(part, 'function_call'):
+                                                        func_name = part.function_call.name
+                                                        # Convert MapComposite to a regular dict
+                                                        func_args = dict(part.function_call.args.items()) if hasattr(part.function_call.args, 'items') else {}
+                                                        self.logger.info(f"Calling function: {func_name} with args: {func_args}")
+                                                        print("gokul",[msg.get('role') for msg in self.messages[-5:]])
+                                                        # Check if we're already in a function call to prevent infinite loops
+                                                       
+                                                        # Find and call the tool function
+                                                        tool_found = False
+                                                        for tool in self.tools:
+                                                            for func_decl in tool.get('function_declarations', []):
+                                                                if func_decl['name'] == func_name:
+                                                                    tool_found = True
+                                                                    try:
+                                                                        # Call the tool function with the provided arguments
+                                                                        result = await self.session.call_tool(func_name, func_args)
+                                                                        
+                                                                        # If we get a result, format it and return directly
+                                                                        if result:
+                                                                            return f"Here's what I found about {func_args.get('query', 'your query')} in {func_args.get('library', 'the library')}:\n\n{result}"
+                                                                        else:
+                                                                            return "I couldn't find any relevant information. Could you try a different query?"
+                                                                    except Exception as e:
+                                                                        self.logger.error(f"Error executing tool {func_name}: {e}")
+                                                                        return f"I encountered an error while processing your request: {str(e)}"
+                                                        
+                                                        if not tool_found:
+                                                            error_msg = f"I don't have access to the '{func_name}' tool right now."
+                                                            self.logger.error(error_msg)
+                                                            return error_msg
                                     
                                 except Exception as e:
                                     self.logger.error(f"Error calling tool {func_name}: {e}")
