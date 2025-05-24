@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Dict, Any
 from contextlib import AsyncExitStack
 import traceback
 
@@ -9,8 +9,32 @@ from .utils.logger import logger
 import json
 import os
 
-from anthropic import Anthropic
-from anthropic.types import Message
+from google.generativeai import configure, GenerativeModel
+
+
+def clean_schema_recursively(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively clean a JSON schema to make it compatible with Google's API."""
+    if not isinstance(schema, dict):
+        return schema
+    
+    # Create a new dict to avoid modifying the original
+    cleaned = {}
+    
+    for key, value in schema.items():
+        # Skip 'title' fields
+        if key == 'title':
+            continue
+        
+        # Recursively clean nested dictionaries
+        if isinstance(value, dict):
+            cleaned[key] = clean_schema_recursively(value)
+        # Recursively clean items in lists
+        elif isinstance(value, list):
+            cleaned[key] = [clean_schema_recursively(item) if isinstance(item, dict) else item for item in value]
+        else:
+            cleaned[key] = value
+    
+    return cleaned
 
 
 class MCPClient:
@@ -18,10 +42,36 @@ class MCPClient:
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-        self.llm = Anthropic()
+        
+        # Get API key from environment variables
+        api_key = os.environ.get('GOOGLE_API_KEY')
+        if not api_key:
+            self.logger.warning("GOOGLE_API_KEY not found in environment variables")
+        else:
+            # Configure the Google API with the key
+            configure(api_key=api_key)
+        
+        # Initialize Google Generative AI model
+        self.llm = GenerativeModel(model_name="gemini-2.0-flash")
         self.tools = []
         self.messages = []
         self.logger = logger
+        
+    def add_message(self, role: str, content: Any):
+        """
+        Add a message to the conversation history.
+        
+        Args:
+            role: The role of the message sender ('user', 'assistant', or 'tool')
+            content: The content of the message (can be string, dict, or list)
+        """
+        try:
+            message = {"role": role, "content": content}
+            self.messages.append(message)
+            self.logger.debug(f"Added message: {message}")
+        except Exception as e:
+            self.logger.error(f"Error adding message: {e}", exc_info=True)
+            raise
 
     # connect to the MCP server
     async def connect_to_server(self, server_script_path: str):
@@ -49,18 +99,39 @@ class MCPClient:
             self.logger.info("Connected to MCP server")
 
             mcp_tools = await self.get_mcp_tools()
-            self.tools = [
-                {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": tool.inputSchema,
-                }
-                for tool in mcp_tools
-            ]
+            # Convert MCP tools to Google's function calling format
+            self.tools = []
+            for tool in mcp_tools:
+                # Create a Google-compatible schema by recursively cleaning it
+                schema = tool.inputSchema
+                clean_schema = clean_schema_recursively(schema)
+                
+                # Ensure we have the minimum required fields for a valid schema
+                if isinstance(clean_schema, dict):
+                    if 'type' not in clean_schema:
+                        clean_schema['type'] = 'object'
+                else:
+                    # If schema is not a dict, create a minimal valid schema
+                    clean_schema = {'type': 'object', 'properties': {}}
+                
+                self.tools.append({
+                    "function_declarations": [
+                        {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": clean_schema,
+                        }
+                    ]
+                })
+                
+                # Log the cleaned schema for debugging
+                self.logger.info(f"Cleaned schema for {tool.name}: {clean_schema}")
 
-            self.logger.info(
-                f"Available tools: {[tool['name'] for tool in self.tools]}"
-            )
+            # Log available tools
+            tool_names = []
+            if self.tools and 'function_declarations' in self.tools[0]:
+                tool_names = [tool['name'] for tool in self.tools[0]['function_declarations']]
+            self.logger.info(f"Available tools: {tool_names}")
 
             return True
 
@@ -82,74 +153,115 @@ class MCPClient:
     async def process_query(self, query: str):
         try:
             self.logger.info(f"Processing query: {query}")
-            user_message = {"role": "user", "content": query}
-            self.messages = [user_message]
-
-            while True:
-                response = await self.call_llm()
-
-                # the response is a text message
-                if response.content[0].type == "text" and len(response.content) == 1:
-                    assistant_message = {
-                        "role": "assistant",
-                        "content": response.content[0].text,
-                    }
-                    self.messages.append(assistant_message)
-                    await self.log_conversation()
-                    break
-
-                # the response is a tool call
-                assistant_message = {
-                    "role": "assistant",
-                    "content": response.to_dict()["content"],
-                }
-                self.messages.append(assistant_message)
-                await self.log_conversation()
-
-                for content in response.content:
-                    if content.type == "tool_use":
-                        tool_name = content.name
-                        tool_args = content.input
-                        tool_use_id = content.id
-                        self.logger.info(
-                            f"Calling tool {tool_name} with args {tool_args}"
-                        )
-                        try:
-                            result = await self.session.call_tool(tool_name, tool_args)
-                            self.logger.info(f"Tool {tool_name} result: {result}...")
-                            self.messages.append(
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "tool_result",
-                                            "tool_use_id": tool_use_id,
-                                            "content": result.content,
-                                        }
-                                    ],
-                                }
-                            )
-                            await self.log_conversation()
-                        except Exception as e:
-                            self.logger.error(f"Error calling tool {tool_name}: {e}")
-                            raise
-
-            return self.messages
-
+            self.add_message("user", query)
+            
+            # Initial LLM call
+            response = await self.call_llm()
+            
+            # Process the response
+            if hasattr(response, 'candidates') and response.candidates:
+                for candidate in response.candidates:
+                    if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                        for part in candidate.content.parts:
+                            # Handle text response
+                            if hasattr(part, 'text') and part.text:
+                                self.add_message("assistant", part.text)
+                                return part.text
+                                
+                            # Handle function calls
+                            elif hasattr(part, 'function_call'):
+                                func_name = part.function_call.name
+                                
+                                # Parse arguments safely
+                                tool_args = {}
+                                try:
+                                    if hasattr(part.function_call, 'args'):
+                                        if isinstance(part.function_call.args, str):
+                                            tool_args = json.loads(part.function_call.args)
+                                        elif hasattr(part.function_call.args, 'items'):
+                                            # Convert to a regular dict
+                                            tool_args = {k: v for k, v in part.function_call.args.items()}
+                                except Exception as e:
+                                    self.logger.error(f"Error parsing function args: {e}")
+                                    continue
+                                
+                                self.logger.info(f"Calling tool {func_name} with args {tool_args}")
+                                try:
+                                    # Call the tool with the parsed arguments
+                                    result = await self.session.call_tool(func_name, tool_args)
+                                    result_content = result.content if hasattr(result, 'content') else str(result)
+                                    
+                                    # Add tool result to conversation
+                                    self.add_message("tool", {
+                                        "tool_use_id": f"call_{func_name}",
+                                        "content": str(result_content)
+                                    })
+                                    
+                                    # Call LLM again with tool result
+                                    response = await self.call_llm()
+                                    print(response,"aaaaaaaaaaaaaaaaaa")
+                                    if hasattr(response, 'candidates') and response.candidates:
+                                        for candidate in response.candidates:
+                                            if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                                                print("huha",candidate.content.parts)
+                                                for part in candidate.content.parts:
+                                                    if hasattr(part, 'text') and part.text:
+                                                        self.add_message("assistant", part.text)
+                                                        return part.text
+                                    
+                                except Exception as e:
+                                    self.logger.error(f"Error calling tool {func_name}: {e}")
+                                    continue
+            
+            # If we get here, we didn't find any text response
+            error_msg = "Sorry, I couldn't generate a response. Please try again."
+            self.logger.error(f"No valid response found in: {response}")
+            return error_msg
+            
         except Exception as e:
-            self.logger.error(f"Error processing query: {e}")
-            raise
+            self.logger.error(f"Error in process_query: {str(e)}", exc_info=True)
+            return f"An error occurred: {str(e)}"
 
     # call llm
     async def call_llm(self):
         try:
             self.logger.info("Calling LLM")
-            return self.llm.messages.create(
-                model="gemini-2.0-flash",
-                max_tokens=1000,
-                messages=self.messages,
-                tools=self.tools,
+            # Convert messages to Google's format if needed
+            google_messages = []
+            for msg in self.messages:
+                role = msg["role"]
+                content = msg["content"]
+                
+                # Handle string content
+                if isinstance(content, str):
+                    google_messages.append({"role": role, "parts": [{"text": content}]})
+                # Handle list content (for tool results)
+                elif isinstance(content, list):
+                    parts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "tool_result":
+                            # Format tool result for Google API
+                            parts.append({
+                                "function_response": {
+                                    "name": item.get("tool_use_id", "").split("_")[-1],  # Extract tool name
+                                    "response": {"content": item.get("content", "")}
+                                }
+                            })
+                        else:
+                            # Default to text for other types
+                            parts.append({"text": str(item)})
+                    google_messages.append({"role": role, "parts": parts})
+            
+            self.logger.info(f"Google messages: {google_messages}")
+            self.logger.info(f"Tools: {self.tools}")
+            
+            # Call the Google Generative AI model
+            response = self.llm.generate_content(
+                google_messages,
+                generation_config={"max_output_tokens": 1000},
+                tools=self.tools if self.tools else None
             )
+            return response
         except Exception as e:
             self.logger.error(f"Error calling LLM: {e}")
             raise
@@ -171,31 +283,49 @@ class MCPClient:
 
         for message in self.messages:
             try:
-                serializable_message = {"role": message["role"], "content": []}
+                # Create a basic serializable message structure
+                serializable_message = {"role": message["role"]}
 
-                # Handle both string and list content
+                # Handle different content types
                 if isinstance(message["content"], str):
+                    # String content can be used directly
                     serializable_message["content"] = message["content"]
                 elif isinstance(message["content"], list):
+                    # For list content, we need to process each item
+                    serializable_content = []
                     for content_item in message["content"]:
+                        # Convert various object types to dictionaries
                         if hasattr(content_item, "to_dict"):
-                            serializable_message["content"].append(
-                                content_item.to_dict()
-                            )
+                            serializable_content.append(content_item.to_dict())
                         elif hasattr(content_item, "dict"):
-                            serializable_message["content"].append(content_item.dict())
+                            serializable_content.append(content_item.dict())
                         elif hasattr(content_item, "model_dump"):
-                            serializable_message["content"].append(
-                                content_item.model_dump()
-                            )
+                            serializable_content.append(content_item.model_dump())
+                        elif isinstance(content_item, dict):
+                            # Make sure all dict values are serializable
+                            safe_dict = {}
+                            for k, v in content_item.items():
+                                # Convert any non-serializable values to strings
+                                if isinstance(v, (str, int, float, bool, type(None))):
+                                    safe_dict[k] = v
+                                else:
+                                    safe_dict[k] = str(v)
+                            serializable_content.append(safe_dict)
                         else:
-                            serializable_message["content"].append(content_item)
+                            # For any other type, convert to string
+                            serializable_content.append(str(content_item))
+                    
+                    serializable_message["content"] = serializable_content
+                else:
+                    # For any other type, convert to string
+                    serializable_message["content"] = str(message["content"])
 
                 serializable_conversation.append(serializable_message)
             except Exception as e:
-                self.logger.error(f"Error processing message: {str(e)}")
-                self.logger.debug(f"Message content: {message}")
-                raise
+                self.logger.error(f"Error processing message for logging: {str(e)}")
+                self.logger.debug(f"Problematic message: {str(message)[:200]}...")
+                # Don't raise the exception, just log it and continue
+                continue
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filepath = os.path.join("conversations", f"conversation_{timestamp}.json")
@@ -205,5 +335,6 @@ class MCPClient:
                 json.dump(serializable_conversation, f, indent=2, default=str)
         except Exception as e:
             self.logger.error(f"Error writing conversation to file: {str(e)}")
-            self.logger.debug(f"Serializable conversation: {serializable_conversation}")
-            raise
+            # Log a truncated version of the conversation to avoid overwhelming logs
+            self.logger.debug(f"Serializable conversation sample: {str(serializable_conversation)[:500]}...")
+            # Don't raise the exception, just log it
