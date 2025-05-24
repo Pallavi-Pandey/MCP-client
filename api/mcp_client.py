@@ -5,7 +5,7 @@ import traceback
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from datetime import datetime
-from utils.logger import logger
+from .utils.logger import logger
 import json
 import os
 
