@@ -1,4 +1,4 @@
-# Model Context Protocol (MCP) Client
+# Mcp Client Python
 
 A client-side implementation of the Model Context Protocol, allowing for seamless integration with MCP servers and AI agents.
 
